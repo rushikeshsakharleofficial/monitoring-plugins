@@ -13,9 +13,9 @@ import optparse
 import pprint
 import sys
 
-import boto
-import boto.rds
-import boto.ec2.cloudwatch
+import boto3
+import boto3.session
+import botocore.exceptions
 
 # Nagios status codes
 OK = 0
@@ -35,7 +35,7 @@ class RDS(object):
         self.identifier = identifier
 
         if self.region == 'all':
-            self.regions_list = [reg.name for reg in boto.rds.regions()]
+            self.regions_list = boto3.session.Session().get_available_regions('rds')
         else:
             self.regions_list = [self.region]
 
@@ -43,9 +43,11 @@ class RDS(object):
         if self.identifier:
             for reg in self.regions_list:
                 try:
-                    rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
-                    self.info = rds.get_all_dbinstances(self.identifier)
-                except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
+                    session = boto3.session.Session(profile_name=self.profile, region_name=reg)
+                    rds = session.client('rds')
+                    result = rds.describe_db_instances(DBInstanceIdentifier=self.identifier)
+                    self.info = result['DBInstances']
+                except (botocore.exceptions.ProfileNotFound, botocore.exceptions.ClientError) as msg:
                     debug(msg)
                 else:
                     # Exit on the first region and identifier match
@@ -64,41 +66,44 @@ class RDS(object):
         result = dict()
         for reg in self.regions_list:
             try:
-                rds = boto.rds.connect_to_region(reg, profile_name=self.profile)
-                result[reg] = rds.get_all_dbinstances()
-            except (boto.provider.ProfileNotFoundError, boto.exception.BotoServerError) as msg:
+                session = boto3.session.Session(profile_name=self.profile, region_name=reg)
+                rds = session.client('rds')
+                result[reg] = rds.describe_db_instances()['DBInstances']
+            except (botocore.exceptions.ProfileNotFound, botocore.exceptions.ClientError) as msg:
                 debug(msg)
 
         return result
 
     def get_metric(self, metric, start_time, end_time, step):
         """Get RDS metric from CloudWatch"""
-        cw_conn = boto.ec2.cloudwatch.connect_to_region(self.region, profile_name=self.profile)
+        session = boto3.session.Session(profile_name=self.profile, region_name=self.region)
+        cw_conn = session.client('cloudwatch')
         result = cw_conn.get_metric_statistics(
-            step,
-            start_time,
-            end_time,
-            metric,
-            'AWS/RDS',
-            'Average',
-            dimensions={'DBInstanceIdentifier': [self.identifier]}
+            Namespace='AWS/RDS',
+            MetricName=metric,
+            Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': self.identifier}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=step,
+            Statistics=['Average']
         )
-        if result:
-            if len(result) > 1:
+        datapoints = result.get('Datapoints', [])
+        if datapoints:
+            if len(datapoints) > 1:
                 # Get the last point
-                result = sorted(result, key=lambda k: k['Timestamp'])
-                result.reverse()
+                datapoints = sorted(datapoints, key=lambda k: k['Timestamp'])
+                datapoints.reverse()
 
-            result = float('%.2f' % result[0]['Average'])
+            return float('%.2f' % datapoints[0]['Average'])
 
-        return result
+        return datapoints
 
 
 def debug(val):
     """Debugging output"""
     global options
     if options.debug:
-        print 'DEBUG: %s' % val
+        print('DEBUG: %s' % val)
 
 
 def main():
@@ -188,7 +193,7 @@ def main():
     parser.add_option('-l', '--list', help='list of all DB instances',
                       action='store_true', default=False, dest='db_list')
     parser.add_option('-n', '--profile', default=None,
-                      help='AWS profile from ~/.boto or /etc/boto.cfg. Default: None, fallbacks to "[Credentials]".')
+                      help='AWS profile from ~/.aws/credentials. Default: None.')
     parser.add_option('-r', '--region', default='us-east-1',
                       help='AWS region. Default: us-east-1. If set to "all", we try to detect the instance region '
                            'across all of them, note this will be slower than if you specify the region explicitly.')
@@ -212,7 +217,7 @@ def main():
     options, _ = parser.parse_args()
 
     if options.debug:
-        boto.set_stream_logger('boto')
+        boto3.set_stream_logger('boto3')
 
     rds = RDS(region=options.region, profile=options.profile, identifier=options.ident)
 
@@ -222,7 +227,7 @@ def main():
         sys.exit()
     elif options.db_list:
         info = rds.get_list()
-        print 'List of all DB instances in %s region(s):' % (options.region,)
+        print('List of all DB instances in %s region(s):' % (options.region,))
         pprint.pprint(info)
         sys.exit()
     elif not options.ident:
@@ -231,9 +236,9 @@ def main():
     elif options.printinfo:
         info = rds.get_info()
         if info:
-            pprint.pprint(vars(info))
+            pprint.pprint(info)
         else:
-            print 'No DB instance "%s" found on your AWS account and %s region(s).' % (options.ident, options.region)
+            print('No DB instance "%s" found on your AWS account and %s region(s).' % (options.ident, options.region))
 
         sys.exit()
     elif not options.metric or options.metric not in metrics.keys():
@@ -265,12 +270,7 @@ def main():
             note = 'Unable to get RDS instance'
         else:
             status = OK
-            try:
-                version = info.EngineVersion
-            except:
-                version = info.engine_version
-
-            note = '%s %s. Status: %s' % (info.engine, version, info.status)
+            note = '%s %s. Status: %s' % (info['Engine'], info['EngineVersion'], info['DBInstanceStatus'])
 
     # RDS Load Average
     elif options.metric == 'load':
@@ -351,12 +351,12 @@ def main():
             note = 'Unable to get RDS details and statistics'
         else:
             if options.metric == 'storage':
-                storage = float(info.allocated_storage)
+                storage = float(info['AllocatedStorage'])
             elif options.metric == 'memory':
                 try:
-                    storage = db_classes[info.instance_class]
+                    storage = db_classes[info['DBInstanceClass']]
                 except:
-                    print 'Unknown DB instance class "%s"' % info.instance_class
+                    print('Unknown DB instance class "%s"' % info['DBInstanceClass'])
                     sys.exit(CRITICAL)
 
             free = '%.2f' % (free / 1024 ** 3)
@@ -382,12 +382,12 @@ def main():
 
     # Final output
     if status != UNKNOWN and perf_data:
-        print '%s %s | %s' % (short_status[status], note, perf_data)
+        print('%s %s | %s' % (short_status[status], note, perf_data))
     elif status == UNKNOWN and not options.forceunknown:
-        print '%s %s | null' % ('OK', note)
+        print('%s %s | null' % ('OK', note))
         sys.exit(0)
     else:
-        print '%s %s' % (short_status[status], note)
+        print('%s %s' % (short_status[status], note))
 
     sys.exit(status)
 
@@ -412,9 +412,8 @@ pmp-check-aws-rds.py - Check Amazon RDS metrics.
   Options:
     -h, --help            show this help message and exit
     -l, --list            list of all DB instances
-    -n PROFILE, --profile-name=PROFILE
-                          AWS profile from ~/.boto or /etc/boto.cfg. Default:
-                          None, fallbacks to "[Credentials]".
+    -n PROFILE, --profile=PROFILE
+                          AWS profile from ~/.aws/credentials. Default: None.
     -r REGION, --region=REGION
                           AWS region. Default: us-east-1. If set to "all", we
                           try to detect the instance region across all of them,
@@ -437,29 +436,22 @@ pmp-check-aws-rds.py - Check Amazon RDS metrics.
 
 =head1 REQUIREMENTS
 
-This plugin is written on Python and utilizes the module C<boto> (Python interface
+This plugin is written in Python and utilizes the module C<boto3> (Python interface
 to Amazon Web Services) to get various RDS metrics from CloudWatch and compare
 them against the thresholds.
 
-* Install the package: C<yum install python-boto> or C<apt-get install python-boto>
-* Create a config /etc/boto.cfg or ~nagios/.boto with your AWS API credentials.
-  See http://code.google.com/p/boto/wiki/BotoConfig
+* Install the package: C<pip install boto3>
+* Configure AWS credentials via C<~/.aws/credentials> or IAM role.
+  See https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html
 
 This plugin that is supposed to be run by Nagios, i.e. under ``nagios`` user,
-should have permissions to read the config /etc/boto.cfg or ~nagios/.boto.
+should have permissions to read the credentials file or use an IAM role.
 
-Example:
+Example credentials file:
 
-  [root@centos6 ~]# cat /etc/boto.cfg
-  [Credentials]
+  [default]
   aws_access_key_id = THISISATESTKEY
   aws_secret_access_key = thisisatestawssecretaccesskey
-
-If you do not use this config with other tools such as our Cacti script,
-you can secure this file the following way:
-
-  [root@centos6 ~]# chown nagios /etc/boto.cfg
-  [root@centos6 ~]# chmod 600 /etc/boto.cfg
 
 =head1 DESCRIPTION
 
@@ -504,8 +496,8 @@ Nagios check for the free storage space, specify thresholds as percentage or GB:
   # ./pmp-check-aws-rds.py -i blackbox -m storage -u GB -w 10 -c 5
   OK Free storage: 162.55 GB (33%) of 500.0 GB | free_storage=162.55;10.0;5.0;0;500.0
 
-By default, the region is set to ``us-east-1``. You can re-define it globally in boto config or
-specify with -r option. The following command will list all instances across all regions under your AWS account:
+By default, the region is set to ``us-east-1``. You can re-define it with -r option.
+The following command will list all instances across all regions under your AWS account:
 
   # ./pmp-check-aws-rds.py -r all -l
 
